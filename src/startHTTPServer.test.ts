@@ -692,6 +692,60 @@ it("does not require auth for OPTIONS requests", async () => {
   await httpServer.close();
 });
 
+it("allows onUnhandledRequest to serve routes without auth", async () => {
+  const port = await getRandomPort();
+  const apiKey = "test-api-key-unhandled";
+
+  const httpServer = await startHTTPServer({
+    apiKey,
+    createServer: async () => {
+      const mcpServer = new Server(
+        { name: "test", version: "1.0.0" },
+        { capabilities: {} },
+      );
+      return mcpServer;
+    },
+    onUnhandledRequest: async (req, res) => {
+      if (req.url === "/health") {
+        res.writeHead(200).end("ok");
+      } else if (req.url === "/ready") {
+        res.writeHead(200).end("ready");
+      }
+      // Don't write response for unknown paths — fall through to MCP handlers
+    },
+    port,
+  });
+
+  // /health works without auth
+  const healthResponse = await fetch(`http://localhost:${port}/health`);
+  expect(healthResponse.status).toBe(200);
+  expect(await healthResponse.text()).toBe("ok");
+
+  // /ready works without auth
+  const readyResponse = await fetch(`http://localhost:${port}/ready`);
+  expect(readyResponse.status).toBe(200);
+  expect(await readyResponse.text()).toBe("ready");
+
+  // POST /mcp without auth still returns 401
+  const mcpResponse = await fetch(`http://localhost:${port}/mcp`, {
+    body: JSON.stringify({
+      id: 1,
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        capabilities: {},
+        clientInfo: { name: "test", version: "1.0.0" },
+        protocolVersion: "2025-03-26",
+      },
+    }),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  });
+  expect(mcpResponse.status).toBe(401);
+
+  await httpServer.close();
+});
+
 // Stateless OAuth 2.0 JWT Bearer Token Authentication Tests (PR #37)
 
 it("accepts requests with valid Bearer token in stateless mode", async () => {

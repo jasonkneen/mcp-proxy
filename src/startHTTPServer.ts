@@ -938,7 +938,16 @@ export const startHTTPServer = async <T extends ServerLike>({
       return;
     }
 
-    // Check authentication for all other endpoints
+    // Let non-MCP routes (e.g. /health, /ready, OAuth metadata) be handled
+    // before auth — API key auth protects MCP protocol endpoints, not custom routes.
+    if (onUnhandledRequest) {
+      await onUnhandledRequest(req, res);
+      if (res.writableEnded) {
+        return;
+      }
+    }
+
+    // Check authentication for MCP protocol endpoints
     if (!authMiddleware.validateRequest(req)) {
       const authResponse = authMiddleware.getUnauthorizedResponse();
       res.writeHead(401, authResponse.headers);
@@ -982,11 +991,7 @@ export const startHTTPServer = async <T extends ServerLike>({
       return;
     }
 
-    if (onUnhandledRequest) {
-      await onUnhandledRequest(req, res);
-    } else {
-      res.writeHead(404).end();
-    }
+    res.writeHead(404).end();
   };
 
   let httpServer;
