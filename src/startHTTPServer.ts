@@ -938,7 +938,27 @@ export const startHTTPServer = async <T extends ServerLike>({
       return;
     }
 
-    // Check authentication for all other endpoints
+    // Determine whether the request targets an MCP protocol endpoint (SSE
+    // or HTTP Stream). For those endpoints, onUnhandledRequest MUST NOT run
+    // first — some consumers (e.g. fastmcp) use it as a catch-all 404 handler
+    // and would otherwise short-circuit the MCP protocol handlers.
+    // Use a fixed base because `host` may be "::" (IPv6 any), which is not a
+    // valid URL authority. We only need pathname here.
+    const requestUrl = new URL(req.url || "", "http://localhost");
+    const isMcpEndpoint =
+      (sseEndpoint && requestUrl.pathname === sseEndpoint) ||
+      (streamEndpoint && requestUrl.pathname === streamEndpoint);
+
+    // Let non-MCP routes (e.g. /health, /ready, OAuth metadata) be handled
+    // before auth — API key auth protects MCP protocol endpoints, not custom routes.
+    if (onUnhandledRequest && !isMcpEndpoint) {
+      await onUnhandledRequest(req, res);
+      if (res.writableEnded) {
+        return;
+      }
+    }
+
+    // Check authentication for MCP protocol endpoints
     if (!authMiddleware.validateRequest(req)) {
       const authResponse = authMiddleware.getUnauthorizedResponse();
       res.writeHead(401, authResponse.headers);
@@ -982,11 +1002,7 @@ export const startHTTPServer = async <T extends ServerLike>({
       return;
     }
 
-    if (onUnhandledRequest) {
-      await onUnhandledRequest(req, res);
-    } else {
-      res.writeHead(404).end();
-    }
+    res.writeHead(404).end();
   };
 
   let httpServer;
