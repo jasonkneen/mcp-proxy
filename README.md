@@ -84,7 +84,7 @@ tunnel established at https://abcdefghij.tunnel.gla.ma
 > [!NOTE]
 > The requested subdomain may not be available. The actual URL will be displayed when the tunnel is established.
 
-This feature is powered by [pipenet](https://github.com/AugmentHQ/pipenet) and sponsored by [glama.ai](https://glama.ai). For more information, see the [pipenet announcement](https://glama.ai/blog/2026-01-19-pipenet).
+This feature is powered by [pipenet](https://github.com/punkpeye/pipenet) and sponsored by [glama.ai](https://glama.ai). For more information, see the [pipenet announcement](https://glama.ai/blog/2026-01-19-pipenet).
 
 ### Stateless Mode
 
