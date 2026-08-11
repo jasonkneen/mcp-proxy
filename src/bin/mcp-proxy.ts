@@ -137,6 +137,12 @@ const argv = await yargs(hideBin(process.argv))
         "The server type to use (sse or stream). By default, both are enabled",
       type: "string",
     },
+    sessionIdleTimeout: {
+      default: 1800000,
+      describe:
+        "How long (in milliseconds) a stateful stream session survives with no stream attached and no requests before it is closed (default: 30 minutes). Most clients never send the DELETE that would end their session, so without this each one that simply stops talking stays resident for the life of the process. A session with a stream attached is never closed, however quiet. Set to 0 to keep every session until its client sends DELETE",
+      type: "number",
+    },
     shell: {
       default: false,
       describe: "Spawn the server via the user's shell",
@@ -200,6 +206,13 @@ if (!(argv.eventStoreMaxEvents >= 1)) {
 if (!(argv.maxBodySize >= 0)) {
   console.error(
     `Error: --maxBodySize must be a number >= 0 (got ${String(argv.maxBodySize)}). Use --maxBodySize 0 to disable the limit instead.`,
+  );
+  process.exit(1);
+}
+
+if (!(argv.sessionIdleTimeout >= 0)) {
+  console.error(
+    `Error: --sessionIdleTimeout must be a number >= 0 (got ${String(argv.sessionIdleTimeout)}). Use --sessionIdleTimeout 0 to keep sessions until their client sends DELETE instead.`,
   );
   process.exit(1);
 }
@@ -310,6 +323,7 @@ const proxy = async () => {
         uris,
       }),
     port: argv.port,
+    sessionIdleTimeout: argv.sessionIdleTimeout,
     sseEndpoint:
       argv.server && argv.server !== "sse"
         ? null

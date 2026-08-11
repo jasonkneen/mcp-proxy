@@ -3082,3 +3082,337 @@ it("returns 500 instead of crashing when connecting the server fails on the stat
     process.off("unhandledRejection", onUnhandledRejection);
   }
 }, 15_000);
+
+/**
+ * Ending a session is the client's job, and 2025-era clients overwhelmingly
+ * never do it - they close a laptop or lose a network and are never heard from
+ * again. The tests below cover the reaper that reclaims those, and the two ways
+ * it could get liveness wrong: reaping a client that is merely quiet, and
+ * treating a long-attached stream as staleness the moment it drops.
+ */
+const initializeStreamSession = async (port: number) => {
+  const response = await fetch(`http://localhost:${port}/mcp`, {
+    body: JSON.stringify({
+      id: 1,
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        capabilities: {},
+        clientInfo: { name: "test", version: "1.0.0" },
+        protocolVersion: "2025-03-26",
+      },
+    }),
+    headers: {
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+    },
+    method: "POST",
+  });
+
+  const sessionId = response.headers.get("mcp-session-id");
+
+  // Draining rather than cancelling leaves the session with nothing attached,
+  // which is the state the reaper is meant to act on.
+  await response.text();
+
+  expect(sessionId).toBeTruthy();
+
+  return sessionId!;
+};
+
+const pingStreamSession = (port: number, sessionId: string) =>
+  fetch(`http://localhost:${port}/mcp`, {
+    body: JSON.stringify({ id: 2, jsonrpc: "2.0", method: "ping" }),
+    headers: {
+      Accept: "application/json, text/event-stream",
+      "Content-Type": "application/json",
+      "mcp-session-id": sessionId,
+    },
+    method: "POST",
+  });
+
+it("closes a stream session whose client went away without a DELETE", async () => {
+  const port = await getRandomPort();
+  const onClose = vi.fn().mockResolvedValue(undefined);
+
+  const httpServer = await startHTTPServer({
+    createServer: async () =>
+      new Server({ name: "test", version: "1.0.0" }, { capabilities: {} }),
+    onClose,
+    port,
+    sessionIdleTimeout: 250,
+  });
+
+  try {
+    const sessionId = await initializeStreamSession(port);
+
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledTimes(1), {
+      timeout: 5_000,
+    });
+
+    const afterReap = await pingStreamSession(port, sessionId);
+
+    expect(afterReap.status).toBe(404);
+    expect(await afterReap.text()).toContain("Session not found");
+  } finally {
+    await httpServer.close();
+  }
+}, 15_000);
+
+it("keeps a stream session that is attached but making no requests", async () => {
+  const port = await getRandomPort();
+  const onClose = vi.fn().mockResolvedValue(undefined);
+
+  const httpServer = await startHTTPServer({
+    createServer: async () =>
+      new Server({ name: "test", version: "1.0.0" }, { capabilities: {} }),
+    onClose,
+    port,
+    sessionIdleTimeout: 250,
+  });
+
+  const controller = new AbortController();
+
+  try {
+    const sessionId = await initializeStreamSession(port);
+
+    const notifications = await fetch(`http://localhost:${port}/mcp`, {
+      headers: {
+        Accept: "text/event-stream",
+        "mcp-session-id": sessionId,
+      },
+      method: "GET",
+      signal: controller.signal,
+    });
+
+    expect(notifications.status).toBe(200);
+
+    // Several sweeps' worth. A client parked on the notification stream issues
+    // no requests at all, so idleness measured on requests alone would reap it
+    // here - which is exactly what `keepAliveTimeout` exists to prevent.
+    await delay(1_500);
+
+    expect(onClose).not.toHaveBeenCalled();
+
+    const stillServing = await pingStreamSession(port, sessionId);
+
+    expect(stillServing.status).toBe(200);
+
+    await stillServing.text();
+  } finally {
+    controller.abort();
+
+    await httpServer.close();
+  }
+}, 15_000);
+
+it("starts the idle countdown when the stream drops, not at the last request", async () => {
+  const port = await getRandomPort();
+
+  let closedAt: number | undefined;
+
+  const onClose = vi.fn().mockImplementation(async () => {
+    closedAt ??= Date.now();
+  });
+
+  const sessionIdleTimeout = 800;
+
+  const httpServer = await startHTTPServer({
+    createServer: async () =>
+      new Server({ name: "test", version: "1.0.0" }, { capabilities: {} }),
+    onClose,
+    port,
+    sessionIdleTimeout,
+  });
+
+  const controller = new AbortController();
+
+  try {
+    const sessionId = await initializeStreamSession(port);
+
+    const notifications = await fetch(`http://localhost:${port}/mcp`, {
+      headers: {
+        Accept: "text/event-stream",
+        "mcp-session-id": sessionId,
+      },
+      method: "GET",
+      signal: controller.signal,
+    });
+
+    expect(notifications.status).toBe(200);
+
+    // Long enough that a countdown running from the last request has expired
+    // many times over by the time the stream drops.
+    await delay(2_400);
+
+    const droppedAt = Date.now();
+
+    controller.abort();
+
+    await vi.waitFor(() => expect(closedAt).toBeDefined(), { timeout: 5_000 });
+
+    // Measured rather than probed, because a probe request would itself count
+    // as activity. A countdown anchored to the last request would have expired
+    // before the drop and reaped on the first sweep after it; anchoring to the
+    // drop cannot close sooner than the timeout.
+    expect(closedAt! - droppedAt).toBeGreaterThanOrEqual(sessionIdleTimeout);
+  } finally {
+    controller.abort();
+
+    await httpServer.close();
+  }
+}, 15_000);
+
+it("keeps every stream session when sessionIdleTimeout is 0", async () => {
+  const port = await getRandomPort();
+  const onClose = vi.fn().mockResolvedValue(undefined);
+
+  const httpServer = await startHTTPServer({
+    createServer: async () =>
+      new Server({ name: "test", version: "1.0.0" }, { capabilities: {} }),
+    onClose,
+    port,
+    sessionIdleTimeout: 0,
+  });
+
+  try {
+    const sessionId = await initializeStreamSession(port);
+
+    await delay(1_000);
+
+    expect(onClose).not.toHaveBeenCalled();
+
+    const stillServing = await pingStreamSession(port, sessionId);
+
+    expect(stillServing.status).toBe(200);
+
+    await stillServing.text();
+  } finally {
+    await httpServer.close();
+  }
+}, 15_000);
+
+it("does not reap a session while a slow request is still on the wire", async () => {
+  const port = await getRandomPort();
+  const onClose = vi.fn().mockResolvedValue(undefined);
+
+  const httpServer = await startHTTPServer({
+    createServer: async () =>
+      new Server({ name: "test", version: "1.0.0" }, { capabilities: {} }),
+    onClose,
+    port,
+    sessionIdleTimeout: 300,
+  });
+
+  try {
+    const sessionId = await initializeStreamSession(port);
+
+    const body = JSON.stringify({ id: 2, jsonrpc: "2.0", method: "ping" });
+
+    const answer = await new Promise<{ status: number; text: string }>(
+      (resolve, reject) => {
+        const request = http.request(
+          {
+            headers: {
+              Accept: "application/json, text/event-stream",
+              "Content-Type": "application/json",
+              "mcp-session-id": sessionId,
+              "Transfer-Encoding": "chunked",
+            },
+            host: "localhost",
+            method: "POST",
+            path: "/mcp",
+            port,
+          },
+          (response) => {
+            let text = "";
+
+            response.setEncoding("utf8");
+            response.on("data", (chunk: string) => {
+              text += chunk;
+            });
+            response.on("end", () => {
+              resolve({ status: response.statusCode!, text });
+            });
+          },
+        );
+
+        request.on("error", reject);
+
+        // Dribbled out so the upload alone outlasts the idle timeout several
+        // times over. Claiming the session only after the body is read would
+        // let a sweep close it here, and the client would be told its session
+        // does not exist after uploading the whole request successfully.
+        void (async () => {
+          for (const chunk of body) {
+            request.write(chunk);
+
+            await delay(20);
+          }
+
+          request.end();
+        })();
+      },
+    );
+
+    expect(answer.status).toBe(200);
+    expect(answer.text).not.toContain("Session not found");
+    expect(onClose).not.toHaveBeenCalled();
+  } finally {
+    await httpServer.close();
+  }
+}, 15_000);
+
+it("finishes reaping a session whose onClose rejects", async () => {
+  const port = await getRandomPort();
+
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejections.push(reason);
+  };
+
+  process.on("unhandledRejection", onUnhandledRejection);
+
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+  const server = new Server(
+    { name: "test", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  const serverClose = vi.spyOn(server, "close");
+
+  const onClose = vi.fn().mockRejectedValue(new Error("onClose failed"));
+
+  const httpServer = await startHTTPServer({
+    createServer: async () => server,
+    onClose,
+    port,
+    sessionIdleTimeout: 250,
+  });
+
+  try {
+    await initializeStreamSession(port);
+
+    await vi.waitFor(() => expect(onClose).toHaveBeenCalledTimes(1), {
+      timeout: 5_000,
+    });
+
+    // Several more sweeps. The SDK invokes `onclose` without awaiting it, so a
+    // rejection escaping teardown is unhandled - fatal under Node's default -
+    // and abandons the rest of it, leaving the session behind with its cleanup
+    // flag already set so nothing retries.
+    await delay(1_000);
+
+    await vi.waitFor(() => expect(serverClose).toHaveBeenCalledTimes(1), {
+      timeout: 5_000,
+    });
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(unhandledRejections).toEqual([]);
+  } finally {
+    await httpServer.close();
+
+    consoleError.mockRestore();
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
+}, 15_000);

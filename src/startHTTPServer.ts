@@ -31,6 +31,24 @@ import { InMemoryEventStore } from "./InMemoryEventStore.js";
 const DEFAULT_KEEP_ALIVE_TIMEOUT = 300_000;
 
 /**
+ * How long a 2025-era stream session with nothing attached to it is kept before
+ * the reaper closes it.
+ *
+ * Generous on purpose. The only thing a session with no attached stream can
+ * still do is serve a `Last-Event-ID` resumption, and the default event store
+ * is per-session, in-memory and capped, so a client returning half an hour
+ * later has little to come back to. Weighed against that, sessions that are
+ * never reclaimed accumulate for the life of the process.
+ */
+const DEFAULT_SESSION_IDLE_TIMEOUT = 1_800_000;
+
+/**
+ * How often the reaper looks. Independent of the timeout, so the sweep stays
+ * cheap when the timeout is long; clamped to the timeout when it is short.
+ */
+const SESSION_SWEEP_INTERVAL = 60_000;
+
+/**
  * How long `close()` waits for still-running requests before destroying what is
  * left. Well under the CLI's 5s graceful-shutdown budget, so a forced close
  * still leaves room for the process to exit cleanly.
@@ -523,7 +541,17 @@ const cleanupServer = async <T extends ServerLike>(
   onClose?: (server: T) => Promise<void>,
 ) => {
   if (onClose) {
-    await onClose(server);
+    // Contained, because the caller is `transport.onclose`, which the SDK
+    // invokes without awaiting: a rejection here would surface as an unhandled
+    // rejection - fatal under Node's default - and would abandon the rest of
+    // teardown, leaving the session in `activeTransports` with its cleanup
+    // flag already set, so nothing would ever retry it. The 2026-07-28 leg
+    // contains its `onClose` for the same reason.
+    try {
+      await onClose(server);
+    } catch (error) {
+      console.error("[mcp-proxy] error in onClose", error);
+    }
   }
 
   try {
@@ -846,6 +874,109 @@ const createModernLeg = <T extends ServerLike>({
   };
 };
 
+/**
+ * One 2025-era stream session, plus the two signals the reaper reads to decide
+ * whether the client behind it still exists.
+ *
+ * A session deliberately outlives the connection that created it - that is what
+ * makes replay-on-reconnect possible - so a dropped socket is not by itself the
+ * end of a session, and the SDK does not treat it as one. What is missing is
+ * anything that ever decides the client is not coming back, and deciding that
+ * takes both fields: `openStreams` alone would reap a client that is mid-
+ * request, and `lastActivityAt` alone would reap a client parked on an open
+ * notification stream making no requests, which is an ordinary thing for a
+ * stateful client to do and exactly what `keepAliveTimeout` exists to protect.
+ */
+type StreamSession<T> = {
+  /**
+   * Set once the reaper has closed this session. The entry outlives that call -
+   * the SDK's `close()` does not await the `onclose` that removes it - so
+   * without this a slow teardown would be re-selected and re-closed by every
+   * sweep it spans.
+   */
+  closing: boolean;
+  /**
+   * When this session last received a request or finished a response. Only
+   * consulted while `openStreams` is 0; an attached stream keeps the session
+   * alive however stale this is.
+   */
+  lastActivityAt: number;
+  /** Responses currently attached to this session, streaming or not. */
+  openStreams: number;
+  server: T;
+  transport: NodeStreamableHTTPServerTransport;
+};
+
+/**
+ * Marks a session busy for as long as `res` is attached, and stamps the idle
+ * clock at both ends.
+ *
+ * The stamp on close is the one that matters. A dropped connection ends the
+ * response, so it starts the countdown at the moment the client actually went
+ * away rather than at its last request - without which a client that sat on a
+ * quiet stream for an hour would be counted an hour stale the instant it drops,
+ * and reaped before it could resume.
+ */
+const trackSessionStream = <T>(
+  session: StreamSession<T>,
+  res: http.ServerResponse,
+) => {
+  session.lastActivityAt = Date.now();
+
+  // A connection already gone by the time we get here has emitted `close`
+  // as well, so subscribing now would hold the count above zero forever and
+  // make the session immortal - the leak this is here to prevent.
+  if (res.closed) {
+    return;
+  }
+
+  session.openStreams += 1;
+
+  // Fires for a completed response and an aborted one alike, so the count
+  // cannot be stranded by a client vanishing mid-stream.
+  res.once("close", () => {
+    session.lastActivityAt = Date.now();
+    session.openStreams -= 1;
+  });
+};
+
+/**
+ * Closes sessions whose client is gone.
+ *
+ * Teardown runs through `transport.close()` rather than dropping the entry, so
+ * a reaped session takes the same path a `DELETE` takes: the transport's
+ * `onclose` is what invokes `onClose`, closes the `Server` - which is where
+ * `proxyServer` releases its upstream subscription lease - and removes the
+ * entry. Nothing here has to know about any of that.
+ */
+const reapIdleSessions = async <T>(
+  sessions: Record<string, StreamSession<T>>,
+  idleTimeout: number,
+) => {
+  const now = Date.now();
+
+  for (const [sessionId, session] of Object.entries(sessions)) {
+    if (
+      session.closing ||
+      session.openStreams > 0 ||
+      now - session.lastActivityAt <= idleTimeout
+    ) {
+      continue;
+    }
+
+    console.log(
+      `[mcp-proxy] closing session ${sessionId}, idle for over ${idleTimeout}ms`,
+    );
+
+    // Marked before rather than after, because `close()` returns as soon as it
+    // has handed off to `onclose` - the entry is still here at that point, and
+    // stays until teardown finishes.
+    session.closing = true;
+
+    await session.transport.close();
+  }
+};
+
 const handleStreamRequest = async <T extends ServerLike>({
   activeTransports,
   authenticate,
@@ -864,10 +995,7 @@ const handleStreamRequest = async <T extends ServerLike>({
   res,
   stateless,
 }: {
-  activeTransports: Record<
-    string,
-    { server: T; transport: NodeStreamableHTTPServerTransport }
-  >;
+  activeTransports: Record<string, StreamSession<T>>;
   authenticate?: (request: http.IncomingMessage) => Promise<unknown>;
   authMiddleware: AuthenticationMiddleware;
   createServer: (request: http.IncomingMessage) => Promise<T>;
@@ -896,6 +1024,20 @@ const handleStreamRequest = async <T extends ServerLike>({
         : Array.isArray(req.headers["mcp-session-id"])
           ? req.headers["mcp-session-id"][0]
           : req.headers["mcp-session-id"];
+
+      // Claimed here rather than at the session lookup below, because
+      // everything in between can wait: reading a slow or large body,
+      // `authenticate`, the modern leg's classification. A request that has
+      // been on the wire longer than the idle timeout would otherwise be
+      // answered with `Session not found` after uploading successfully,
+      // its session reaped out from under it.
+      const pendingSession = sessionId
+        ? activeTransports[sessionId]
+        : undefined;
+
+      if (pendingSession) {
+        trackSessionStream(pendingSession, res);
+      }
 
       let transport: NodeStreamableHTTPServerTransport;
 
@@ -1056,6 +1198,8 @@ const handleStreamRequest = async <T extends ServerLike>({
         transport = activeTransport.transport;
         server = activeTransport.server;
 
+        // Already claimed above, before the first await.
+
         // Update session's auth context with fresh authentication result
         if (
           authResult &&
@@ -1076,10 +1220,21 @@ const handleStreamRequest = async <T extends ServerLike>({
           onsessioninitialized: (_sessionId) => {
             // add only when the id Session id is generated (skip in stateless mode)
             if (!stateless && _sessionId) {
-              activeTransports[_sessionId] = {
+              const session: StreamSession<T> = {
+                closing: false,
+                lastActivityAt: Date.now(),
+                openStreams: 0,
                 server,
                 transport,
               };
+
+              activeTransports[_sessionId] = session;
+
+              // The `initialize` response is this session's first attached
+              // stream. Counting it here rather than at the shared
+              // `handleRequest` below is what keeps a session created and then
+              // immediately abandoned from starting life at zero activity.
+              trackSessionStream(session, res);
             }
           },
           sessionIdGenerator: stateless ? undefined : randomUUID,
@@ -1207,12 +1362,9 @@ const handleStreamRequest = async <T extends ServerLike>({
     new URL(req.url!, "http://localhost").pathname === endpoint
   ) {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    const activeTransport:
-      | {
-          server: T;
-          transport: NodeStreamableHTTPServerTransport;
-        }
-      | undefined = sessionId ? activeTransports[sessionId] : undefined;
+    const activeTransport: StreamSession<T> | undefined = sessionId
+      ? activeTransports[sessionId]
+      : undefined;
 
     if (!sessionId) {
       // Return METHOD_NOT_ALLOWED so stateless clients' transport stops reconnecting
@@ -1256,6 +1408,8 @@ const handleStreamRequest = async <T extends ServerLike>({
         `[mcp-proxy] establishing new SSE stream for session ID ${sessionId}`,
       );
     }
+
+    trackSessionStream(activeTransport, res);
 
     await activeTransport.transport.handleRequest(req, res);
 
@@ -1448,6 +1602,7 @@ export const startHTTPServer = async <T extends ServerLike>({
   onListenSubscriptions,
   onUnhandledRequest,
   port,
+  sessionIdleTimeout = DEFAULT_SESSION_IDLE_TIMEOUT,
   sseEndpoint = "/sse",
   sslCa,
   sslCert,
@@ -1507,7 +1662,8 @@ export const startHTTPServer = async <T extends ServerLike>({
    * The unit of "a server" differs by protocol era: a 2025-era connection holds
    * one instance for the life of its session, while 2026-07-28 builds a fresh
    * one per request - so on that leg this fires once per request. Keep it cheap
-   * and idempotent.
+   * and idempotent. A rejection is logged and does not stop the rest of
+   * teardown.
    */
   onClose?: (server: T) => Promise<void>;
   /**
@@ -1527,6 +1683,23 @@ export const startHTTPServer = async <T extends ServerLike>({
     res: http.ServerResponse,
   ) => Promise<void>;
   port: number;
+  /**
+   * How long a stateful stream session survives with no stream attached and no
+   * requests before it is closed, in milliseconds. Default: 1800000 (30
+   * minutes). Pass `0` to keep every session until its client sends `DELETE`.
+   *
+   * Ending a session is the client's job, and most 2025-era clients never do
+   * it - they close a laptop or lose a network and are simply never heard from
+   * again. Each one left behind holds a `Server`, a transport and an event
+   * store that goes on buffering notifications it can no longer deliver, for as
+   * long as the process runs.
+   *
+   * A session with a stream attached is never closed however long it has been
+   * quiet, so this does not cut off a client parked on the notification stream.
+   * What it costs is resumability past the timeout: a client returning later
+   * with a `Last-Event-ID` gets a new session instead of its replay.
+   */
+  sessionIdleTimeout?: number;
   sseEndpoint?: null | string;
   sslCa?: null | string;
   sslCert?: null | string;
@@ -1536,13 +1709,7 @@ export const startHTTPServer = async <T extends ServerLike>({
 }): Promise<SSEServer> => {
   const activeSSETransports: Record<string, SSEServerTransport> = {};
 
-  const activeStreamTransports: Record<
-    string,
-    {
-      server: T;
-      transport: NodeStreamableHTTPServerTransport;
-    }
-  > = {};
+  const activeStreamTransports: Record<string, StreamSession<T>> = {};
 
   const authMiddleware = new AuthenticationMiddleware({ apiKey, oauth });
 
@@ -1697,6 +1864,44 @@ export const startHTTPServer = async <T extends ServerLike>({
     keepAliveTimeout + 1000,
   );
 
+  // Sessions survive the connections that create them, and are meant to be
+  // ended by a `DELETE` that most clients never send. Without this sweep, every
+  // client that just stops talking leaves its session resident for the life of
+  // the process.
+  let sweeping = false;
+
+  const sessionReaper =
+    sessionIdleTimeout > 0
+      ? setInterval(
+          () => {
+            // A sweep yields on each session it closes, so a large enough
+            // backlog can span ticks. Overlapping sweeps would not corrupt
+            // anything - `closing` already keeps one session from being closed
+            // twice - but they would pile up redundant passes over the map.
+            if (sweeping) {
+              return;
+            }
+
+            sweeping = true;
+
+            void reapIdleSessions(activeStreamTransports, sessionIdleTimeout)
+              .catch((error: unknown) => {
+                console.error(
+                  "[mcp-proxy] error sweeping idle sessions",
+                  error,
+                );
+              })
+              .finally(() => {
+                sweeping = false;
+              });
+          },
+          Math.min(SESSION_SWEEP_INTERVAL, sessionIdleTimeout),
+        )
+      : undefined;
+
+  // Reclaiming memory is not a reason to keep a process alive.
+  sessionReaper?.unref();
+
   await new Promise((resolve) => {
     httpServer.listen(port, host, () => {
       resolve(undefined);
@@ -1705,6 +1910,10 @@ export const startHTTPServer = async <T extends ServerLike>({
 
   return {
     close: async () => {
+      if (sessionReaper) {
+        clearInterval(sessionReaper);
+      }
+
       for (const transport of Object.values(activeSSETransports)) {
         await transport.close();
       }

@@ -125,6 +125,7 @@ options:
 - `--connectionTimeout`: Timeout in milliseconds for the initial connection to the MCP server (default: 60000)
 - `--requestTimeout`: Timeout in milliseconds for requests to the MCP server (default: 300000)
 - `--keepAliveTimeout`: HTTP keep-alive timeout in milliseconds for stateful stream sessions (default: 300000)
+- `--sessionIdleTimeout`: How long in milliseconds a stateful stream session survives with no stream attached and no requests before it is closed (default: 1800000, 30 minutes). Set to `0` to keep every session until its client sends `DELETE`. See [Abandoned sessions](#abandoned-sessions).
 - `--eventStore`: Enable the resumability event store, letting clients replay missed messages after a reconnect (default: `true`). `--no-eventStore` disables it. See [Resumability and memory use](#resumability-and-memory-use).
 - `--eventStoreMaxEvents`: Maximum number of buffered events the resumability event store retains per session before it evicts the oldest (default: 1000). Ignored when `--no-eventStore` is set.
 - `--maxBodySize`: Maximum request body size in bytes accepted by the streamable HTTP endpoint; larger requests are answered with `413 Payload Too Large` (default: 10485760, 10 MiB). Set to `0` to disable the limit. See [Request body size](#request-body-size).
@@ -346,6 +347,7 @@ Options:
 - `port`: Port number to listen on
 - `host`: Host to bind to (default: "::")
 - `keepAliveTimeout`: HTTP keep-alive timeout in milliseconds for stateful stream sessions (default: 300000)
+- `sessionIdleTimeout`: How long in milliseconds a stateful stream session survives with no stream attached and no requests before it is closed (default: 1800000, 30 minutes). Pass `0` to keep every session until its client sends `DELETE`. See [Abandoned sessions](#abandoned-sessions).
 - `maxBodySize`: Caps how many bytes of a request body the streamable HTTP endpoint buffers; larger requests are answered with `413 Payload Too Large` (default: 10485760, 10 MiB). Pass `false` to disable the cap. See [Request body size](#request-body-size).
 - `sseEndpoint`: SSE endpoint path (default: "/sse", set to null to disable)
 - `streamEndpoint`: Streamable HTTP endpoint path (default: "/mcp", set to null to disable)
@@ -354,7 +356,7 @@ Options:
 - `apiKey`: API key for authenticating requests (optional)
 - `cors`: CORS configuration (default: enabled with permissive settings, see CORS Configuration section)
 - `onConnect`: Callback when a server instance is created (optional). Fires once per session on the 2025-era legs and **once per request** on the 2026-07-28 leg, which builds a fresh instance per request.
-- `onClose`: Callback when a server instance is torn down (optional). Same per-era unit as `onConnect`; keep it cheap and idempotent.
+- `onClose`: Callback when a server instance is torn down (optional). Same per-era unit as `onConnect`; keep it cheap and idempotent. A rejection is logged and does not stop the rest of teardown.
 - `onUnhandledRequest`: Callback for unhandled HTTP requests (optional)
 
 Returns `{ close, notify }`. See [Change notifications](#change-notifications)
@@ -423,6 +425,32 @@ Don't need resume-after-reconnect? `--no-eventStore` (CLI) or
 `eventStore: false` (library) drops the bookkeeping entirely. For a larger
 replay window or shared storage across processes (e.g. Redis), pass your own
 `EventStore` — you're then responsible for bounding its size.
+
+##### Abandoned sessions
+
+A 2025-era session outlives the connection that created it — that is what makes
+replay-on-reconnect work — and is meant to be ended by a `DELETE`. In practice
+most clients never send one: they close a laptop, get killed, or lose a network,
+and are simply never heard from again. Each session left behind holds a server
+instance, a transport, and an event store that goes on buffering notifications
+it can no longer deliver.
+
+`mcp-proxy` closes a session once nothing is attached to it and nothing has
+happened for 30 minutes (`--sessionIdleTimeout` / `sessionIdleTimeout`). A
+session with a stream attached is never closed however quiet it is, so a client
+parked on the notification stream is unaffected; the countdown starts when the
+stream drops, not at the last request. Closing runs the same path a `DELETE`
+does, so `onClose` fires exactly as it always has.
+
+What this costs is resumability past the timeout: a client returning later with
+a `Last-Event-ID` gets a new session instead of its replay. With the default
+in-memory store capped at 1000 events, there is usually little left to replay by
+then anyway. Set the timeout to `0` to keep every session until its client sends
+`DELETE`.
+
+Sessions on the `/sse` endpoint end with their connection and are unaffected, as
+are `--stateless` mode and protocol revision 2026-07-28, neither of which
+retains anything between requests.
 
 ##### Request body size
 
