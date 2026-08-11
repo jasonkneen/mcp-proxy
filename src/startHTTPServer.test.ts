@@ -3004,3 +3004,81 @@ it("buffers a request body without limit when maxBodySize is false", async () =>
     await httpServer.close();
   }
 }, 30_000);
+
+it("returns 500 instead of crashing when connecting the server fails on the stateless path", async () => {
+  // Regression test: the stream POST paths called `server.connect(transport)`
+  // without awaiting it. `Protocol.connect()` returns a promise, so a
+  // rejection escaped the `try`/`catch` that wraps the whole handler, became
+  // an unhandled rejection and killed the process on Node >= 15 instead of
+  // producing the 500 the catch block is there to produce.
+  //
+  // The failure is injected directly: `connect` rejects on every request, so
+  // the 500s below depend only on the handler awaiting `connect`, never on
+  // the ordering of async events. (An earlier version of this test triggered
+  // the rejection with a shared, already-connected `Server` and raced the
+  // first transport's `onclose`, which made it flaky in CI.)
+  const port = await getRandomPort();
+
+  const unhandledRejections: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown) => {
+    unhandledRejections.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+  const server = new Server(
+    { name: "test", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  vi.spyOn(server, "connect").mockRejectedValue(
+    new Error("Already connected to a transport"),
+  );
+
+  const httpServer = await startHTTPServer({
+    createServer: async () => server,
+    port,
+    stateless: true,
+  });
+
+  const postToMcp = (body: unknown) =>
+    fetch(`http://localhost:${port}/mcp`, {
+      body: JSON.stringify(body),
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      method: "POST",
+    });
+
+  try {
+    // An initialize request with no session id takes the first of the two
+    // branches that had the missing await.
+    const initialize = await postToMcp({
+      id: 1,
+      jsonrpc: "2.0",
+      method: "initialize",
+      params: {
+        capabilities: {},
+        clientInfo: { name: "test", version: "1.0.0" },
+        protocolVersion: "2025-03-26",
+      },
+    });
+    await initialize.body?.cancel();
+
+    // A request with no session id that is not an initialize takes the other
+    // branch, which had the same missing await.
+    const ping = await postToMcp({ id: 2, jsonrpc: "2.0", method: "ping" });
+    await ping.body?.cancel();
+
+    // Give any rejection a tick to surface before asserting.
+    await delay(100);
+
+    expect(initialize.status).toBe(500);
+    expect(ping.status).toBe(500);
+    expect(unhandledRejections).toEqual([]);
+  } finally {
+    await httpServer.close();
+    consoleError.mockRestore();
+    process.off("unhandledRejection", onUnhandledRejection);
+  }
+}, 15_000);
