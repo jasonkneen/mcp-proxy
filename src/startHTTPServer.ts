@@ -1830,6 +1830,7 @@ export const startHTTPServer = async <T extends ServerLike>({
       } catch (error) {
         throw new Error(
           `Failed to read CA file '${sslCa}': ${(error as Error).message}`,
+          { cause: error },
         );
       }
     }
@@ -1839,6 +1840,7 @@ export const startHTTPServer = async <T extends ServerLike>({
       } catch (error) {
         throw new Error(
           `Failed to read certificate file '${sslCert}': ${(error as Error).message}`,
+          { cause: error },
         );
       }
     }
@@ -1848,6 +1850,7 @@ export const startHTTPServer = async <T extends ServerLike>({
       } catch (error) {
         throw new Error(
           `Failed to read key file '${sslKey}': ${(error as Error).message}`,
+          { cause: error },
         );
       }
     }
