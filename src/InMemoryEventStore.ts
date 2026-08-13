@@ -36,6 +36,12 @@ export class InMemoryEventStore implements EventStore {
   }
   private events: Map<string, { message: JSONRPCMessage; streamId: string }> =
     new Map();
+  /**
+   * Keeps event IDs in stream-local insertion order so replay can walk only the
+   * relevant stream instead of sorting the entire global event map on every
+   * reconnect.
+   */
+  private eventIdsByStream = new Map<string, string[]>();
   private lastTimestamp = 0;
   private lastTimestampCounter = 0;
 
@@ -69,38 +75,37 @@ export class InMemoryEventStore implements EventStore {
       return "";
     }
 
-    // Extract the stream ID from the event ID
     const streamId = this.getStreamIdFromEventId(lastEventId);
 
     if (!streamId) {
       return "";
     }
 
-    let foundLastEvent = false;
+    const eventIdsForStream = this.eventIdsByStream.get(streamId);
 
-    // Sort events by eventId for chronological ordering
-    const sortedEvents = [...this.events.entries()].sort((a, b) =>
-      a[0].localeCompare(b[0]),
-    );
+    if (!eventIdsForStream) {
+      return "";
+    }
 
-    for (const [
-      eventId,
-      { message, streamId: eventStreamId },
-    ] of sortedEvents) {
-      // Only include events from the same stream
-      if (eventStreamId !== streamId) {
+    const lastEventIndex = eventIdsForStream.indexOf(lastEventId);
+
+    if (lastEventIndex === -1) {
+      return "";
+    }
+
+    for (
+      let index = lastEventIndex + 1;
+      index < eventIdsForStream.length;
+      index++
+    ) {
+      const eventId = eventIdsForStream[index];
+      const storedEvent = this.events.get(eventId);
+
+      if (!storedEvent) {
         continue;
       }
 
-      // Start sending events after we find the lastEventId
-      if (eventId === lastEventId) {
-        foundLastEvent = true;
-        continue;
-      }
-
-      if (foundLastEvent) {
-        await send(eventId, message);
-      }
+      await send(eventId, storedEvent.message);
     }
 
     return streamId;
@@ -115,6 +120,10 @@ export class InMemoryEventStore implements EventStore {
 
     this.events.set(eventId, { message, streamId });
 
+    const streamEvents = this.eventIdsByStream.get(streamId) ?? [];
+    streamEvents.push(eventId);
+    this.eventIdsByStream.set(streamId, streamEvents);
+
     // Map iterates in insertion order, so the first key is always the
     // oldest surviving event - evicting it is a plain FIFO/ring buffer.
     while (this.events.size > this.maxEvents) {
@@ -124,7 +133,24 @@ export class InMemoryEventStore implements EventStore {
         break;
       }
 
+      const oldestEvent = this.events.get(oldestEventId);
       this.events.delete(oldestEventId);
+
+      if (oldestEvent) {
+        const streamEventIds = this.eventIdsByStream.get(oldestEvent.streamId);
+
+        if (streamEventIds) {
+          const index = streamEventIds.indexOf(oldestEventId);
+
+          if (index !== -1) {
+            streamEventIds.splice(index, 1);
+          }
+
+          if (streamEventIds.length === 0) {
+            this.eventIdsByStream.delete(oldestEvent.streamId);
+          }
+        }
+      }
     }
 
     return eventId;
