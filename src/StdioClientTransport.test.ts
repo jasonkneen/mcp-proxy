@@ -12,6 +12,25 @@ import { StdioClientTransport } from "./StdioClientTransport.js";
 const childOf = (transport: StdioClientTransport): ChildProcess =>
   (transport as unknown as { _process: ChildProcess })._process;
 
+/**
+ * Never reads stdin, so the pipe backs up and write() returns false - the only
+ * situation the buffered-send path applies to.
+ */
+const DEAF_CHILD = ["-e", "setTimeout(() => {}, 60000)"];
+
+const startTransport = async (args: string[]) => {
+  const transport = new StdioClientTransport({
+    args,
+    command: "node",
+    env: process.env as Record<string, string>,
+    stderr: "ignore",
+  });
+
+  await transport.start();
+
+  return transport;
+};
+
 const messageOfSize = (id: number, bytes: number): JSONRPCMessage => ({
   id,
   jsonrpc: "2.0",
@@ -24,15 +43,7 @@ it("settles pending sends when the child exits before the write drains", async (
   // that stops reading stdin makes write() return false, and if that child
   // then dies the "drain" event never arrives - so the promise stayed pending
   // forever and its "drain" listener stayed attached, one per stuck send.
-  const transport = new StdioClientTransport({
-    // Never reads stdin, so the pipe backs up and write() returns false.
-    args: ["-e", "setTimeout(() => {}, 60000)"],
-    command: "node",
-    env: process.env as Record<string, string>,
-    stderr: "ignore",
-  });
-
-  await transport.start();
+  const transport = await startTransport(DEAF_CHILD);
 
   const child = childOf(transport);
   const stdin = child.stdin!;
@@ -62,7 +73,11 @@ it("settles pending sends when the child exits before the write drains", async (
 
   expect(settled).toEqual(["rejected", "rejected", "rejected"]);
   expect(stdin.listenerCount("drain")).toBe(0);
-  expect(child.listenerCount("exit")).toBe(exitListenersBefore);
+  // Killing the child races several events, and the one that settles the sends
+  // first decides whether spawn's own "exit" listener has fired and removed
+  // itself by now. Only the upper bound is stable, and it is the half that
+  // catches the leak this test is about.
+  expect(child.listenerCount("exit")).toBeLessThanOrEqual(exitListenersBefore);
 
   await transport.close();
 }, 10_000);
@@ -70,14 +85,7 @@ it("settles pending sends when the child exits before the write drains", async (
 it("settles a pending send when the transport is closed", async () => {
   // The same hang on the ordinary shutdown path: close() aborts the child, so
   // a write that has not drained yet can never complete.
-  const transport = new StdioClientTransport({
-    args: ["-e", "setTimeout(() => {}, 60000)"],
-    command: "node",
-    env: process.env as Record<string, string>,
-    stderr: "ignore",
-  });
-
-  await transport.start();
+  const transport = await startTransport(DEAF_CHILD);
 
   const stdin = childOf(transport).stdin!;
 
@@ -96,18 +104,95 @@ it("settles a pending send when the transport is closed", async () => {
   expect(stdin.listenerCount("drain")).toBe(0);
 }, 10_000);
 
+it("rejects a pending send with the error stdin reports", async () => {
+  // A real broken pipe races stdin's "error" and "close" against the child's
+  // "exit", so any one of the three can settle the send and none of them is
+  // pinned by the tests above. Each is emitted directly below instead. This
+  // branch is the one that has to surface the reported error as-is.
+  const transport = await startTransport(DEAF_CHILD);
+
+  const stdin = childOf(transport).stdin!;
+  const closeListenersBefore = stdin.listenerCount("close");
+  const pipeError = new Error("write EPIPE");
+
+  const outcome = transport
+    .send(messageOfSize(1, 1024 * 1024))
+    .then(() => "resolved", (error: Error) => error);
+
+  expect(stdin.listenerCount("drain")).toBe(1);
+
+  stdin.emit("error", pipeError);
+
+  await expect(outcome).resolves.toBe(pipeError);
+  expect(stdin.listenerCount("drain")).toBe(0);
+  expect(stdin.listenerCount("close")).toBe(closeListenersBefore);
+
+  await transport.close();
+}, 10_000);
+
+it("rejects a pending send when stdin closes", async () => {
+  const transport = await startTransport(DEAF_CHILD);
+
+  const stdin = childOf(transport).stdin!;
+  // start() keeps an "error" listener on stdin for the transport's lifetime.
+  const errorListenersBefore = stdin.listenerCount("error");
+
+  const outcome = transport
+    .send(messageOfSize(1, 1024 * 1024))
+    .then(() => "resolved", (error: Error) => error.message);
+
+  expect(stdin.listenerCount("drain")).toBe(1);
+
+  stdin.emit("close");
+
+  await expect(outcome).resolves.toBe(
+    "Stdin closed before the message was sent",
+  );
+  expect(stdin.listenerCount("drain")).toBe(0);
+  expect(stdin.listenerCount("close")).toBe(0);
+  expect(stdin.listenerCount("error")).toBe(errorListenersBefore);
+
+  await transport.close();
+}, 10_000);
+
+it("rejects a pending send when the child reports it has exited", async () => {
+  const transport = await startTransport(DEAF_CHILD);
+
+  const child = childOf(transport);
+  const stdin = child.stdin!;
+  const pid = transport.pid!;
+  const errorListenersBefore = stdin.listenerCount("error");
+
+  const outcome = transport
+    .send(messageOfSize(1, 1024 * 1024))
+    .then(() => "resolved", (error: Error) => error.message);
+
+  expect(stdin.listenerCount("drain")).toBe(1);
+
+  child.emit("exit", null, "SIGTERM");
+
+  await expect(outcome).resolves.toBe(
+    "Child process exited before the message was sent",
+  );
+  expect(stdin.listenerCount("drain")).toBe(0);
+  expect(stdin.listenerCount("close")).toBe(0);
+  expect(stdin.listenerCount("error")).toBe(errorListenersBefore);
+
+  // The synthetic "exit" made spawn() drop its abort-signal listener, so
+  // close() can no longer reap the child. Kill it directly instead.
+  process.kill(pid, "SIGKILL");
+}, 10_000);
+
 it("resolves send() and leaves no listeners behind once a buffered write drains", async () => {
   // The happy path for the same code: a child that does read stdin lets the
   // buffered write flush, so "drain" arrives and the promise resolves - and
-  // the listeners added for the failure paths must be removed too.
-  const transport = new StdioClientTransport({
-    args: ["-e", "process.stdin.resume(); setTimeout(() => {}, 60000)"],
-    command: "node",
-    env: process.env as Record<string, string>,
-    stderr: "ignore",
-  });
-
-  await transport.start();
+  // the listeners added for the failure paths must be removed too. The child
+  // outlives the send here, so spawn's "exit" listener is still in place and
+  // the count has to land back exactly on the baseline.
+  const transport = await startTransport([
+    "-e",
+    "process.stdin.resume(); setTimeout(() => {}, 60000)",
+  ]);
 
   const child = childOf(transport);
   const stdin = child.stdin!;

@@ -168,7 +168,7 @@ export class StdioClientTransport implements Transport {
 
       const onDrain = () => settle();
       const onClose = () =>
-        settle(new Error("stdin closed before the message was sent"));
+        settle(new Error("Stdin closed before the message was sent"));
       const onError = (error: Error) => settle(error);
       const onExit = () =>
         settle(new Error("Child process exited before the message was sent"));
