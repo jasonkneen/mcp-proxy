@@ -183,6 +183,61 @@ it("rejects a pending send when the child reports it has exited", async () => {
   process.kill(pid, "SIGKILL");
 }, 10_000);
 
+it("closes the connection when a message is over the read buffer cap", async () => {
+  // Regression test: `ReadBuffer.append` throws once a message exceeds its cap.
+  // Thrown straight out of the transform's "data" listener, that throw
+  // destroyed the transform the child's stdout is piped into, so every later
+  // message was dropped and onclose never fired - the connection went
+  // permanently deaf instead of failing, and in-flight requests could only end
+  // in a timeout.
+  const oversized = 11 * 1024 * 1024;
+  const transport = await startTransport([
+    "-e",
+    `process.stdout.write('{"jsonrpc":"2.0","id":1,"result":{"pad":"' + 'X'.repeat(${oversized}) + '"}}\\n');` +
+      `setInterval(() => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: 2, result: {} }) + "\\n"), 100);`,
+  ]);
+
+  const errors: string[] = [];
+  const closed = new Promise<"closed">((resolve) => {
+    transport.onclose = () => resolve("closed");
+  });
+  transport.onerror = (error) => errors.push(error.message);
+
+  await expect(
+    Promise.race([closed, delay(5_000).then(() => "still open" as const)]),
+  ).resolves.toBe("closed");
+  expect(errors[0]).toMatch(/ReadBuffer exceeded maximum size/);
+
+  await transport.close();
+}, 15_000);
+
+it("reports an error on the child's stdout instead of crashing the process", async () => {
+  // Regression test: `pipe()` does not forward a source error to its
+  // destination, so the handler on the transform never saw one and the child's
+  // read end had no "error" listener at all. An error there - "read
+  // ECONNRESET" when a child dies abruptly - was an "error" event with no
+  // listener, which EventEmitter rethrows and which therefore took the whole
+  // proxy process down.
+  const transport = await startTransport(DEAF_CHILD);
+
+  const stdout = childOf(transport).stdout!;
+  const readError = Object.assign(new Error("read ECONNRESET"), {
+    code: "ECONNRESET",
+  });
+
+  expect(stdout.listenerCount("error")).toBe(1);
+
+  const reported = new Promise<Error>((resolve) => {
+    transport.onerror = resolve;
+  });
+
+  stdout.emit("error", readError);
+
+  await expect(reported).resolves.toBe(readError);
+
+  await transport.close();
+}, 10_000);
+
 it("resolves send() and leaves no listeners behind once a buffered write drains", async () => {
   // The happy path for the same code: a child that does read stdin lets the
   // buffered write flush, so "drain" arrives and the promise resolves - and
