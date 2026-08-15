@@ -82,6 +82,43 @@ it("settles pending sends when the child exits before the write drains", async (
   await transport.close();
 }, 10_000);
 
+it("fires close exactly once when the transport is closed", async () => {
+  // Regression test (#86): close() emitted the {type:"close"} event and then
+  // aborted the child. The abort tripped both child handlers - the "error"
+  // handler on AbortError and the "close" handler - and each fired onclose (and
+  // the second also re-emitted the close event). So a plain start()/close()
+  // delivered onclose twice and {type:"close"} twice. A single guard collapses
+  // all three paths to one notification.
+  const closeEvents: number[] = [];
+  const transport = new StdioClientTransport({
+    args: ["-e", "setTimeout(() => {}, 60000)"],
+    command: "node",
+    env: process.env as Record<string, string>,
+    onEvent: (event) => {
+      if (event.type === "close") {
+        closeEvents.push(1);
+      }
+    },
+    stderr: "ignore",
+  });
+
+  let oncloseCount = 0;
+  transport.onclose = () => {
+    oncloseCount += 1;
+  };
+
+  await transport.start();
+  await transport.close();
+
+  // The child's "close"/"error" handlers land on a later tick than close()
+  // returns, so give them room to fire before counting. Without the guard this
+  // is where the second onclose and the second close event arrive.
+  await delay(200);
+
+  expect(oncloseCount).toBe(1);
+  expect(closeEvents).toHaveLength(1);
+}, 10_000);
+
 it("settles a pending send when the transport is closed", async () => {
   // The same hang on the ordinary shutdown path: close() aborts the child, so
   // a write that has not drained yet can never complete.
@@ -115,9 +152,10 @@ it("rejects a pending send with the error stdin reports", async () => {
   const closeListenersBefore = stdin.listenerCount("close");
   const pipeError = new Error("write EPIPE");
 
-  const outcome = transport
-    .send(messageOfSize(1, 1024 * 1024))
-    .then(() => "resolved", (error: Error) => error);
+  const outcome = transport.send(messageOfSize(1, 1024 * 1024)).then(
+    () => "resolved",
+    (error: Error) => error,
+  );
 
   expect(stdin.listenerCount("drain")).toBe(1);
 
@@ -137,9 +175,10 @@ it("rejects a pending send when stdin closes", async () => {
   // start() keeps an "error" listener on stdin for the transport's lifetime.
   const errorListenersBefore = stdin.listenerCount("error");
 
-  const outcome = transport
-    .send(messageOfSize(1, 1024 * 1024))
-    .then(() => "resolved", (error: Error) => error.message);
+  const outcome = transport.send(messageOfSize(1, 1024 * 1024)).then(
+    () => "resolved",
+    (error: Error) => error.message,
+  );
 
   expect(stdin.listenerCount("drain")).toBe(1);
 
@@ -163,9 +202,10 @@ it("rejects a pending send when the child reports it has exited", async () => {
   const pid = transport.pid!;
   const errorListenersBefore = stdin.listenerCount("error");
 
-  const outcome = transport
-    .send(messageOfSize(1, 1024 * 1024))
-    .then(() => "resolved", (error: Error) => error.message);
+  const outcome = transport.send(messageOfSize(1, 1024 * 1024)).then(
+    () => "resolved",
+    (error: Error) => error.message,
+  );
 
   expect(stdin.listenerCount("drain")).toBe(1);
 
