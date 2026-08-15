@@ -241,24 +241,41 @@ export class StdioClientTransport implements Transport {
 
       this._process.stdout?.pipe(jsonFilterTransform);
 
-      jsonFilterTransform.on("data", (chunk) => {
-        this.onEvent?.({
-          chunk: chunk.toString(),
-          type: "data",
-        });
-
-        this._readBuffer.append(chunk);
-        this.processReadBuffer();
-      });
-
-      jsonFilterTransform.on("error", (error) => {
+      const reportError = (error: Error) => {
         this.onEvent?.({
           error,
           type: "error",
         });
 
         this.onerror?.(error);
+      };
+
+      jsonFilterTransform.on("data", (chunk) => {
+        this.onEvent?.({
+          chunk: chunk.toString(),
+          type: "data",
+        });
+
+        try {
+          this._readBuffer.append(chunk);
+          this.processReadBuffer();
+        } catch (error) {
+          // `append` throws once a message exceeds the read buffer cap. Left
+          // uncaught it destroys the transform stdout is piped into, so every
+          // later message is dropped and the connection goes deaf instead of
+          // failing. Report and close, like the upstream transport does.
+          reportError(error as Error);
+          this.close().catch(() => {});
+        }
       });
+
+      jsonFilterTransform.on("error", reportError);
+
+      // `pipe()` does not forward a source error to its destination, so the
+      // listener above never sees one. Without this, an error on the child's
+      // stdout is an "error" event with no listener, which EventEmitter
+      // rethrows - taking the whole process down.
+      this._process.stdout?.on("error", reportError);
 
       if (this._stderrStream && this._process.stderr) {
         this._process.stderr.pipe(this._stderrStream);
