@@ -148,4 +148,38 @@ describe("JSONFilterTransform", () => {
     expect(outputLines[1]).toBe('{"type": "response", "id": 2}');
     expect(outputLines[2]).toBe('{"partial": "data"}');
   });
+
+  it("fails instead of buffering an unbounded line with no newline", async () => {
+    // Regression test (#85): a child that writes a lot without ever completing a
+    // line grew `this.buffer` without bound. The downstream ReadBuffer cap never
+    // fired, because it only sees data once a full line is flushed to it - so the
+    // filter sat in front of the cap and could exhaust memory instead of failing.
+    // The buffer is now bounded. The cap is twice the SDK's stdio buffer size, so
+    // a complete (even over-cap) message still reaches ReadBuffer for the
+    // authoritative rejection; this covers the other case - a line that never
+    // terminates and so never reaches ReadBuffer at all.
+    const consoleWarnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => {});
+
+    const transform = new JSONFilterTransform();
+
+    // 21 MiB in one chunk with no newline: over the 20 MiB cap (2x the SDK's
+    // 10 MiB stdio buffer), and never flushed downstream because there is no line
+    // terminator.
+    const oversized = "x".repeat(21 * 1024 * 1024);
+    const readable = Readable.from([oversized]);
+
+    const writable = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    await expect(pipeline(readable, transform, writable)).rejects.toThrow(
+      /buffer exceeded maximum size/,
+    );
+
+    consoleWarnSpy.mockRestore();
+  });
 });
