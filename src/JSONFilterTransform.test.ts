@@ -148,4 +148,40 @@ describe("JSONFilterTransform", () => {
     expect(outputLines[1]).toBe('{"type": "response", "id": 2}');
     expect(outputLines[2]).toBe('{"partial": "data"}');
   });
+  it("preserves multibyte UTF-8 characters split across chunk boundaries", async () => {
+    // Regression: _transform decoded each chunk with chunk.toString(), so a
+    // multibyte UTF-8 character whose bytes landed in two different stdout
+    // chunks was decoded as two invalid halves and replaced with U+FFFD -
+    // silently corrupting any non-ASCII text (emoji, accented Latin, CJK) in a
+    // proxied JSON-RPC message. A StringDecoder holds the partial sequence.
+    const message = JSON.stringify({
+      id: 1,
+      jsonrpc: "2.0",
+      result: { text: "launch \u{1F680} Configuraci\u00F3n a\u00F1adi\u00F3" },
+    });
+    const full = Buffer.from(message + "\n", "utf8");
+
+    // One byte per chunk is the worst case, and a real one: a slow writer or a
+    // pipe under backpressure delivers stdout a few bytes at a time.
+    const byteChunks: Buffer[] = [];
+    for (let i = 0; i < full.length; i++) {
+      byteChunks.push(full.subarray(i, i + 1));
+    }
+
+    const readable = Readable.from(byteChunks);
+    const transform = new JSONFilterTransform();
+    const outputChunks: Buffer[] = [];
+    const writable = new Writable({
+      write(chunk, _encoding, callback) {
+        outputChunks.push(chunk);
+        callback();
+      },
+    });
+
+    await pipeline(readable, transform, writable);
+
+    const output = Buffer.concat(outputChunks).toString("utf8").trim();
+    expect(output).not.toContain("\uFFFD");
+    expect(output).toBe(message);
+  });
 });
