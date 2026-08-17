@@ -106,6 +106,7 @@ export class StdioClientTransport implements Transport {
     return this._process?.stderr ?? null;
   }
   private _abortController: AbortController = new AbortController();
+  private _closed = false;
   private _process?: ChildProcess;
   private _readBuffer: ReadBuffer = new ReadBuffer();
   private _serverParams: StdioServerParameters;
@@ -122,9 +123,7 @@ export class StdioClientTransport implements Transport {
   }
 
   async close(): Promise<void> {
-    this.onEvent?.({
-      type: "close",
-    });
+    this._emitClose();
 
     this._abortController.abort();
     this._process = undefined;
@@ -206,7 +205,7 @@ export class StdioClientTransport implements Transport {
       this._process.on("error", (error) => {
         if (error.name === "AbortError") {
           // Expected when close() is called.
-          this.onclose?.();
+          this._emitClose();
           return;
         }
 
@@ -220,12 +219,8 @@ export class StdioClientTransport implements Transport {
 
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
       this._process.on("close", (_code) => {
-        this.onEvent?.({
-          type: "close",
-        });
-
         this._process = undefined;
-        this.onclose?.();
+        this._emitClose();
       });
 
       this._process.stdin?.on("error", (error) => {
@@ -281,6 +276,30 @@ export class StdioClientTransport implements Transport {
         this._process.stderr.pipe(this._stderrStream);
       }
     });
+  }
+
+  /**
+   * Emit the single close notification for this transport.
+   *
+   * A close can be reached from three places that all follow one `close()`
+   * call: `close()` itself, the child's `error` handler on `AbortError`, and the
+   * child's `close` handler. Left ungated, `close()` emitted the `{type:"close"}`
+   * event and aborted, and the abort then tripped both child handlers - so
+   * `onclose` and the close event each fired twice. This makes the notification
+   * fire exactly once regardless of which path arrives first.
+   */
+  private _emitClose(): void {
+    if (this._closed) {
+      return;
+    }
+
+    this._closed = true;
+
+    this.onEvent?.({
+      type: "close",
+    });
+
+    this.onclose?.();
   }
 
   private processReadBuffer() {
