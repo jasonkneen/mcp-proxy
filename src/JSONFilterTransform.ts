@@ -1,5 +1,22 @@
+import { STDIO_DEFAULT_MAX_BUFFER_SIZE } from "@modelcontextprotocol/client";
 import { Transform } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
+
+/**
+ * Largest incomplete line the filter will buffer before failing. A child that
+ * writes a lot without ever completing a line would otherwise grow `this.buffer`
+ * without bound: the downstream `ReadBuffer` cap never fires, because it only
+ * sees data once a full line is flushed to it, so the filter sat in front of the
+ * cap and could exhaust memory instead of failing.
+ *
+ * Set to twice the SDK's stdio buffer cap rather than equal to it. The filter
+ * holds at most one line still being assembled, and a legitimate message is
+ * bounded by that downstream cap - so a full-size (or even over-cap) message
+ * must still reach `ReadBuffer`, which is the authority on message size and
+ * rejects it there. The headroom lets that happen; anything past it is a line
+ * that will never terminate, which is what this bound exists to stop.
+ */
+const MAX_BUFFER_SIZE = 2 * STDIO_DEFAULT_MAX_BUFFER_SIZE;
 
 /**
  * Extracts JSON-RPC messages from a stream that may contain non-JSON output.
@@ -43,6 +60,20 @@ export class JSONFilterTransform extends Transform {
 
     // Keep the last incomplete line in the buffer
     this.buffer = lines.pop() || "";
+
+    // A single line that never terminates would grow the buffer without bound,
+    // ahead of and invisible to the downstream ReadBuffer cap. Fail here instead
+    // of letting memory run out, matching how ReadBuffer reports its own limit.
+    if (this.buffer.length > MAX_BUFFER_SIZE) {
+      this.buffer = "";
+      callback(
+        new Error(
+          `JSONFilterTransform buffer exceeded maximum size of ${MAX_BUFFER_SIZE} bytes`,
+        ),
+        null,
+      );
+      return;
+    }
 
     const jsonLines = [];
     const nonJsonLines = [];
