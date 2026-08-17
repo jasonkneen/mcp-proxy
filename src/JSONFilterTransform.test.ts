@@ -148,4 +148,74 @@ describe("JSONFilterTransform", () => {
     expect(outputLines[1]).toBe('{"type": "response", "id": 2}');
     expect(outputLines[2]).toBe('{"partial": "data"}');
   });
+  it("fails instead of buffering an unbounded line with no newline", async () => {
+    // Regression test (#85): a child that writes a lot without ever completing a
+    // line grew `this.buffer` without bound. The downstream ReadBuffer cap never
+    // fired, because it only sees data once a full line is flushed to it - so the
+    // filter sat in front of the cap and could exhaust memory instead of failing.
+    // The buffer is now bounded. The cap is twice the SDK's stdio buffer size, so
+    // a complete (even over-cap) message still reaches ReadBuffer for the
+    // authoritative rejection; this covers the other case - a line that never
+    // terminates and so never reaches ReadBuffer at all.
+    const consoleWarnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => {});
+
+    const transform = new JSONFilterTransform();
+
+    // 21 MiB in one chunk with no newline: over the 20 MiB cap (2x the SDK's
+    // 10 MiB stdio buffer), and never flushed downstream because there is no line
+    // terminator.
+    const oversized = "x".repeat(21 * 1024 * 1024);
+    const readable = Readable.from([oversized]);
+
+    const writable = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+
+    await expect(pipeline(readable, transform, writable)).rejects.toThrow(
+      /buffer exceeded maximum size/,
+    );
+
+    consoleWarnSpy.mockRestore();
+  });
+
+  it("preserves multibyte UTF-8 characters split across chunk boundaries", async () => {
+    // Regression: _transform decoded each chunk with chunk.toString(), so a
+    // multibyte UTF-8 character whose bytes landed in two different stdout
+    // chunks was decoded as two invalid halves and replaced with U+FFFD -
+    // silently corrupting any non-ASCII text (emoji, accented Latin, CJK) in a
+    // proxied JSON-RPC message. A StringDecoder holds the partial sequence.
+    const message = JSON.stringify({
+      id: 1,
+      jsonrpc: "2.0",
+      result: { text: "launch \u{1F680} Configuraci\u00F3n a\u00F1adi\u00F3" },
+    });
+    const full = Buffer.from(message + "\n", "utf8");
+
+    // One byte per chunk is the worst case, and a real one: a slow writer or a
+    // pipe under backpressure delivers stdout a few bytes at a time.
+    const byteChunks: Buffer[] = [];
+    for (let i = 0; i < full.length; i++) {
+      byteChunks.push(full.subarray(i, i + 1));
+    }
+
+    const readable = Readable.from(byteChunks);
+    const transform = new JSONFilterTransform();
+    const outputChunks: Buffer[] = [];
+    const writable = new Writable({
+      write(chunk, _encoding, callback) {
+        outputChunks.push(chunk);
+        callback();
+      },
+    });
+
+    await pipeline(readable, transform, writable);
+
+    const output = Buffer.concat(outputChunks).toString("utf8").trim();
+    expect(output).not.toContain("\uFFFD");
+    expect(output).toBe(message);
+  });
 });

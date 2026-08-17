@@ -132,17 +132,51 @@ export class StdioClientTransport implements Transport {
   }
 
   send(message: JSONRPCMessage): Promise<void> {
-    return new Promise((resolve) => {
-      if (!this._process?.stdin) {
+    return new Promise((resolve, reject) => {
+      const child = this._process;
+
+      if (!child?.stdin) {
         throw new Error("Not connected");
       }
 
+      const stdin = child.stdin;
       const json = serializeMessage(message);
-      if (this._process.stdin.write(json)) {
+
+      if (stdin.write(json)) {
         resolve();
-      } else {
-        this._process.stdin.once("drain", resolve);
+
+        return;
       }
+
+      // The payload was buffered instead of flushed, so the write completes on
+      // "drain". That event never arrives if the pipe breaks or the child dies
+      // first, which would leave this promise pending forever and its "drain"
+      // listener attached - one per stuck send. Settle on every termination
+      // path and always detach.
+      const settle = (error?: Error) => {
+        child.off("exit", onExit);
+        stdin.off("close", onClose);
+        stdin.off("drain", onDrain);
+        stdin.off("error", onError);
+
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+
+      const onDrain = () => settle();
+      const onClose = () =>
+        settle(new Error("Stdin closed before the message was sent"));
+      const onError = (error: Error) => settle(error);
+      const onExit = () =>
+        settle(new Error("Child process exited before the message was sent"));
+
+      child.once("exit", onExit);
+      stdin.once("close", onClose);
+      stdin.once("drain", onDrain);
+      stdin.once("error", onError);
     });
   }
 
@@ -207,24 +241,41 @@ export class StdioClientTransport implements Transport {
 
       this._process.stdout?.pipe(jsonFilterTransform);
 
-      jsonFilterTransform.on("data", (chunk) => {
-        this.onEvent?.({
-          chunk: chunk.toString(),
-          type: "data",
-        });
-
-        this._readBuffer.append(chunk);
-        this.processReadBuffer();
-      });
-
-      jsonFilterTransform.on("error", (error) => {
+      const reportError = (error: Error) => {
         this.onEvent?.({
           error,
           type: "error",
         });
 
         this.onerror?.(error);
+      };
+
+      jsonFilterTransform.on("data", (chunk) => {
+        this.onEvent?.({
+          chunk: chunk.toString(),
+          type: "data",
+        });
+
+        try {
+          this._readBuffer.append(chunk);
+          this.processReadBuffer();
+        } catch (error) {
+          // `append` throws once a message exceeds the read buffer cap. Left
+          // uncaught it destroys the transform stdout is piped into, so every
+          // later message is dropped and the connection goes deaf instead of
+          // failing. Report and close, like the upstream transport does.
+          reportError(error as Error);
+          this.close().catch(() => {});
+        }
       });
+
+      jsonFilterTransform.on("error", reportError);
+
+      // `pipe()` does not forward a source error to its destination, so the
+      // listener above never sees one. Without this, an error on the child's
+      // stdout is an "error" event with no listener, which EventEmitter
+      // rethrows - taking the whole process down.
+      this._process.stdout?.on("error", reportError);
 
       if (this._stderrStream && this._process.stderr) {
         this._process.stderr.pipe(this._stderrStream);

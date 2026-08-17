@@ -34,14 +34,14 @@ export class InMemoryEventStore implements EventStore {
   get size(): number {
     return this.events.size;
   }
-  private events: Map<string, { message: JSONRPCMessage; streamId: string }> =
-    new Map();
   /**
    * Keeps event IDs in stream-local insertion order so replay can walk only the
    * relevant stream instead of sorting the entire global event map on every
    * reconnect.
    */
   private eventIdsByStream = new Map<string, string[]>();
+  private events: Map<string, { message: JSONRPCMessage; streamId: string }> =
+    new Map();
   private lastTimestamp = 0;
   private lastTimestampCounter = 0;
 
@@ -62,6 +62,13 @@ export class InMemoryEventStore implements EventStore {
   }
 
   /**
+   * Gets the stream ID associated with a stored event ID.
+   */
+  async getStreamIdForEventId(eventId: string): Promise<string | undefined> {
+    return this.events.get(eventId)?.streamId;
+  }
+
+  /**
    * Replays events that occurred after a specific event ID
    * Implements EventStore.replayEventsAfter
    */
@@ -71,11 +78,11 @@ export class InMemoryEventStore implements EventStore {
       send,
     }: { send: (eventId: string, message: JSONRPCMessage) => Promise<void> },
   ): Promise<string> {
-    if (!lastEventId || !this.events.has(lastEventId)) {
+    if (!lastEventId) {
       return "";
     }
 
-    const streamId = this.getStreamIdFromEventId(lastEventId);
+    const streamId = await this.getStreamIdForEventId(lastEventId);
 
     if (!streamId) {
       return "";
@@ -175,14 +182,5 @@ export class InMemoryEventStore implements EventStore {
     const random = Math.random().toString(36).substring(2, 5);
 
     return `${streamId}_${timestamp}_${counter}_${random}`;
-  }
-
-  /**
-   * Extracts the stream ID from an event ID
-   */
-  private getStreamIdFromEventId(eventId: string): string {
-    const parts = eventId.split("_");
-
-    return parts.length > 0 ? parts[0] : "";
   }
 }

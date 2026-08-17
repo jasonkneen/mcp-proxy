@@ -59,6 +59,38 @@ describe("InMemoryEventStore", () => {
     expect(replayedEvents[2].eventId).toBe(eventIds[4]);
   });
 
+  it("replays the standalone GET stream whose ID begins with an underscore", async () => {
+    const store = new InMemoryEventStore();
+    const streamId = "_GET_stream";
+    const firstMessage: JSONRPCMessage = {
+      jsonrpc: "2.0",
+      method: "notifications/tools/list_changed",
+    };
+    const secondMessage: JSONRPCMessage = {
+      jsonrpc: "2.0",
+      method: "notifications/resources/list_changed",
+    };
+
+    const firstEventId = await store.storeEvent(streamId, firstMessage);
+    const secondEventId = await store.storeEvent(streamId, secondMessage);
+    const replayedEvents: Array<{
+      eventId: string;
+      message: JSONRPCMessage;
+    }> = [];
+
+    const returnedStreamId = await store.replayEventsAfter(firstEventId, {
+      send: async (eventId, message) => {
+        replayedEvents.push({ eventId, message });
+      },
+    });
+
+    expect(returnedStreamId).toBe(streamId);
+    expect(replayedEvents).toEqual([
+      { eventId: secondEventId, message: secondMessage },
+    ]);
+    expect(await store.getStreamIdForEventId(firstEventId)).toBe(streamId);
+  });
+
   it("isolates events by stream ID and only replays events from the same stream", async () => {
     const store = new InMemoryEventStore();
     const streamId1 = "stream-alpha";

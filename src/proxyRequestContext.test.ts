@@ -157,6 +157,44 @@ const connect = async (port: number, protocol: "legacy" | "modern") => {
   return client;
 };
 
+/**
+ * Marks a probe apart from the messages a test actually asserts on, so a
+ * duplicate that lands after the handshake can be ignored rather than counted.
+ */
+const ATTACH_PROBE = "__attach-probe__";
+
+/**
+ * Waits until the connection can actually receive an unsolicited notification.
+ *
+ * The standalone `GET` stream those arrive on is opened in the background once
+ * `notifications/initialized` is accepted, so `connect()` resolves before it is
+ * attached. Anything sent in that window is discarded rather than queued - the
+ * server transport returns early when there is no standalone stream to write
+ * to - so emitting straight after connecting races the stream and loses the
+ * message outright, which no timeout can recover.
+ *
+ * A log message is the probe because it reaches every connection: the level
+ * filter only drops anything once that client has set a level of its own.
+ */
+const attachStandaloneStream = async (client: Client, upstream: Upstream) => {
+  let attached = false;
+
+  client.setNotificationHandler("notifications/message", async () => {
+    attached = true;
+  });
+
+  // Measured at ~22ms to attach, so the interval keeps stray duplicate probes
+  // down while the timeout leaves room for a loaded CI runner.
+  await vi.waitFor(
+    () => {
+      upstream.emitLog("emergency", ATTACH_PROBE);
+
+      expect(attached).toBe(true);
+    },
+    { interval: 25, timeout: 10_000 },
+  );
+};
+
 describe("per-request context crosses the proxy", () => {
   for (const protocol of ["legacy", "modern"] as const) {
     it(`relays progress notifications to a ${protocol} client`, async () => {
@@ -243,10 +281,20 @@ describe("per-request context crosses the proxy", () => {
     const port = await startProxy(upstream);
     const client = await connect(port, "legacy");
 
+    await attachStandaloneStream(client, upstream);
+
     const received: string[] = [];
 
     client.setNotificationHandler("notifications/message", async (n) => {
-      received.push(n.params.data as string);
+      const data = n.params.data as string;
+
+      // A probe that landed after the handshake finished. Ignored rather than
+      // recorded, so it cannot show up as an extra message below.
+      if (data === ATTACH_PROBE) {
+        return;
+      }
+
+      received.push(data);
     });
 
     await client.setLoggingLevel("error");
@@ -270,6 +318,12 @@ describe("per-request context crosses the proxy", () => {
 
     const watcher = await connect(port, "legacy");
     const bystander = await connect(port, "legacy");
+
+    // The bystander's stream especially: one that is not attached yet receives
+    // nothing at all, which would satisfy the "did not overhear" assertion for
+    // entirely the wrong reason.
+    await attachStandaloneStream(watcher, upstream);
+    await attachStandaloneStream(bystander, upstream);
 
     const watched: string[] = [];
     const overheard: string[] = [];

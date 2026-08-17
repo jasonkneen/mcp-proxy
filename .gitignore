@@ -6,3 +6,5 @@ PR-SUBMISSION-GUIDE.md
 ".claude/" 
 src/fixtures/certs/
 src/fixtures/generate-certs.sh
+CLAUDE.local.md
+.envrc
