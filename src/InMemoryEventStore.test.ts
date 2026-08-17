@@ -333,6 +333,57 @@ describe("InMemoryEventStore", () => {
     expect(store.size).toBe(4);
   });
 
+  it("prunes the per-stream replay index in step with eviction", async () => {
+    // Replay walks a per-stream index instead of sorting the whole event map,
+    // so that index is a second structure that has to stay in step with the
+    // events it points at. Replay skips IDs it cannot resolve, which would hide
+    // a desync behind correct-looking output - so assert the index itself.
+    const store = new InMemoryEventStore({ maxEvents: 3 });
+    const index = (
+      store as unknown as { eventIdsByStream: Map<string, string[]> }
+    ).eventIdsByStream;
+    const streamId = "partially-evicted";
+
+    const eventIds: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      eventIds.push(
+        await store.storeEvent(streamId, {
+          id: i,
+          jsonrpc: "2.0",
+          method: `step/${i}`,
+        }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    // The two evicted IDs are dropped from the index, and the survivors stay in
+    // insertion order - which is what replay relies on to pick up mid-stream.
+    expect(index.get(streamId)).toEqual(eventIds.slice(2));
+  });
+
+  it("drops the index entry for a stream whose events are all evicted", async () => {
+    // A stream accumulates one event per server->client message, so a long
+    // session opens many short-lived streams (#72). If a fully evicted stream
+    // kept its index entry, that map would grow without bound even though the
+    // event map itself stays capped.
+    const store = new InMemoryEventStore({ maxEvents: 2 });
+    const index = (
+      store as unknown as { eventIdsByStream: Map<string, string[]> }
+    ).eventIdsByStream;
+
+    for (let i = 0; i < 5; i++) {
+      await store.storeEvent(`stream-${i}`, {
+        id: i,
+        jsonrpc: "2.0",
+        method: `step/${i}`,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    expect(store.size).toBe(2);
+    expect([...index.keys()]).toEqual(["stream-3", "stream-4"]);
+  });
+
   it("defaults to a bounded size when maxEvents is not configured", async () => {
     const store = new InMemoryEventStore();
     const streamId = "default-cap-stream";
