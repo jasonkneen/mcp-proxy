@@ -1,4 +1,5 @@
 import { Transform } from "node:stream";
+import { StringDecoder } from "node:string_decoder";
 
 /**
  * Extracts JSON-RPC messages from a stream that may contain non-JSON output.
@@ -10,12 +11,19 @@ import { Transform } from "node:stream";
  */
 export class JSONFilterTransform extends Transform {
   private buffer = "";
+  // Decode bytes to text through a StringDecoder rather than chunk.toString():
+  // a stdout pipe can split a multibyte UTF-8 character across two chunks, and
+  // decoding each chunk on its own turns the split bytes into U+FFFD. The
+  // decoder holds the incomplete sequence until its remaining bytes arrive.
+  private decoder = new StringDecoder("utf8");
 
   constructor() {
     super({ objectMode: false });
   }
 
   _flush(callback: (error: Error | null, chunk: Buffer | null) => void) {
+    // Flush any bytes the decoder is still holding for an incomplete character.
+    this.buffer += this.decoder.end();
     // Handle any remaining data in buffer
     const json = extractJson(this.buffer);
     if (json !== null) {
@@ -30,7 +38,7 @@ export class JSONFilterTransform extends Transform {
     _encoding: string,
     callback: (error: Error | null, chunk: Buffer | null) => void,
   ) {
-    this.buffer += chunk.toString();
+    this.buffer += this.decoder.write(chunk);
     const lines = this.buffer.split("\n");
 
     // Keep the last incomplete line in the buffer
