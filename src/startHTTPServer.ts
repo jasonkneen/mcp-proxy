@@ -1269,10 +1269,15 @@ const handleStreamRequest = async <T extends ServerLike>({
           return true;
         }
 
-        await server.connect(transport);
+        try {
+          await server.connect(transport);
 
-        if (onConnect) {
-          await onConnect(server);
+          if (onConnect) {
+            await onConnect(server);
+          }
+        } catch (error) {
+          await cleanupServer(server, onClose);
+          throw error;
         }
 
         await transport.handleRequest(req, res, body);
@@ -1297,10 +1302,15 @@ const handleStreamRequest = async <T extends ServerLike>({
           return true;
         }
 
-        await server.connect(transport);
+        try {
+          await server.connect(transport);
 
-        if (onConnect) {
-          await onConnect(server);
+          if (onConnect) {
+            await onConnect(server);
+          }
+        } catch (error) {
+          await cleanupServer(server, onClose);
+          throw error;
         }
 
         await transport.handleRequest(req, res, body);

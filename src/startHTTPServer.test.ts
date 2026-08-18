@@ -3083,6 +3083,121 @@ it("returns 500 instead of crashing when connecting the server fails on the stat
   }
 }, 15_000);
 
+it("closes the legacy server when connect rejects after createServer acquires a resource", async () => {
+  const port = await getRandomPort();
+  let liveResources = 0;
+
+  const server = new Server(
+    { name: "cleanup-repro", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  vi.spyOn(server, "connect").mockRejectedValue(
+    new Error("connect failed after createServer acquired a resource"),
+  );
+  const close = vi.spyOn(server, "close").mockImplementation(async () => {
+    liveResources -= 1;
+  });
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+  const httpServer = await startHTTPServer({
+    createServer: async () => {
+      liveResources += 1;
+      return server;
+    },
+    port,
+    stateless: true,
+  });
+
+  try {
+    const response = await fetch(`http://localhost:${port}/mcp`, {
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "initialize",
+        params: {
+          capabilities: {},
+          clientInfo: { name: "cleanup-repro", version: "1.0.0" },
+          protocolVersion: "2025-03-26",
+        },
+      }),
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      method: "POST",
+    });
+
+    expect(response.status).toBe(500);
+    expect.soft(close).toHaveBeenCalledOnce();
+    expect.soft(liveResources).toBe(0);
+  } finally {
+    // Do not let the intentionally leaked synthetic resource contaminate the
+    // test runner after the red assertion has demonstrated the production gap.
+    liveResources = 0;
+    consoleError.mockRestore();
+    await httpServer.close();
+  }
+}, 15_000);
+
+it("closes the modern server when initialization fails after createServer acquires a resource", async () => {
+  const port = await getRandomPort();
+  let liveResources = 0;
+
+  const server = new Server(
+    { name: "cleanup-control", version: "1.0.0" },
+    { capabilities: { tools: {} } },
+  );
+  const close = vi.spyOn(server, "close").mockImplementation(async () => {
+    liveResources -= 1;
+  });
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+  const httpServer = await startHTTPServer({
+    createServer: async () => {
+      liveResources += 1;
+      return server;
+    },
+    onConnect: async () => {
+      throw new Error("initialization failed after createServer acquired a resource");
+    },
+    port,
+  });
+
+  try {
+    const response = await fetch(`http://localhost:${port}/mcp`, {
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "tools/list",
+        params: {
+          _meta: {
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {
+              name: "cleanup-control",
+              version: "1.0.0",
+            },
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          },
+        },
+      }),
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "mcp-method": "tools/list",
+      },
+      method: "POST",
+    });
+
+    expect(response.status).toBe(500);
+    expect(close).toHaveBeenCalledOnce();
+    expect(liveResources).toBe(0);
+  } finally {
+    liveResources = 0;
+    consoleError.mockRestore();
+    await httpServer.close();
+  }
+}, 15_000);
+
 /**
  * Ending a session is the client's job, and 2025-era clients overwhelmingly
  * never do it - they close a laptop or lose a network and are never heard from
