@@ -2358,7 +2358,90 @@ it("uses default CORS settings when cors: true", async () => {
   expect(response.headers.get("Access-Control-Allow-Headers")).toBe(
     "Content-Type, Authorization, Accept, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-Id, Mcp-Method, Mcp-Name",
   );
-  expect(response.headers.get("Access-Control-Allow-Credentials")).toBe("true");
+  // The default `credentials: true` is deliberately not emitted alongside the
+  // wildcard - see the dedicated test below.
+  expect(response.headers.get("Access-Control-Allow-Credentials")).toBeNull();
+
+  await httpServer.close();
+});
+
+it("never combines wildcard origin with credentials (Fetch Standard forbids it)", async () => {
+  const port = await getRandomPort();
+
+  const httpServer = await startHTTPServer({
+    // No `cors` option passed at all - the actual default path, not `cors: true`.
+    createServer: async () => {
+      const mcpServer = new Server(
+        { name: "test", version: "1.0.0" },
+        { capabilities: {} },
+      );
+      return mcpServer;
+    },
+    port,
+  });
+
+  const response = await fetch(`http://localhost:${port}/mcp`, {
+    headers: {
+      "Access-Control-Request-Method": "POST",
+      Origin: "https://example.com",
+    },
+    method: "OPTIONS",
+  });
+
+  expect(response.status).toBe(204);
+
+  // https://fetch.spec.whatwg.org/#http-access-control-allow-credentials -
+  // a browser rejects the whole CORS response if these two ever appear
+  // together, silently failing every credentialed request. The wildcard stays
+  // and the credentials header drops, rather than the reverse: reflecting the
+  // request origin back would hand any origin a working credentialed grant.
+  expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+  expect(response.headers.get("Access-Control-Allow-Credentials")).toBeNull();
+  expect(response.headers.get("Vary")).toBe("Origin");
+
+  await httpServer.close();
+});
+
+it("still sends credentials when an explicit origin allow-list matches", async () => {
+  const port = await getRandomPort();
+
+  const httpServer = await startHTTPServer({
+    cors: { credentials: true, origin: ["https://app.example"] },
+    createServer: async () => {
+      const mcpServer = new Server(
+        { name: "test", version: "1.0.0" },
+        { capabilities: {} },
+      );
+      return mcpServer;
+    },
+    port,
+  });
+
+  const allowed = await fetch(`http://localhost:${port}/mcp`, {
+    headers: {
+      "Access-Control-Request-Method": "POST",
+      Origin: "https://app.example",
+    },
+    method: "OPTIONS",
+  });
+
+  expect(allowed.headers.get("Access-Control-Allow-Origin")).toBe(
+    "https://app.example",
+  );
+  expect(allowed.headers.get("Access-Control-Allow-Credentials")).toBe("true");
+
+  // A rejected origin still varies by `Origin`, so a shared cache cannot serve
+  // this answer to the allowed one.
+  const rejected = await fetch(`http://localhost:${port}/mcp`, {
+    headers: {
+      "Access-Control-Request-Method": "POST",
+      Origin: "https://evil.example",
+    },
+    method: "OPTIONS",
+  });
+
+  expect(rejected.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  expect(rejected.headers.get("Vary")).toBe("Origin");
 
   await httpServer.close();
 });

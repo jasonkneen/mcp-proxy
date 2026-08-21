@@ -221,6 +221,13 @@ CORS is enabled by default with:
 - **Credentials**: `true`
 - **Exposed Headers**: `Mcp-Session-Id`
 
+`Access-Control-Allow-Credentials` is omitted whenever the allowed origin comes
+out as `*`, because the Fetch Standard makes a browser
+[reject the whole CORS response](https://fetch.spec.whatwg.org/#http-access-control-allow-credentials)
+when it sees both. Credentialed browser requests (`credentials: "include"`,
+`withCredentials`) therefore need an explicit `origin` — a list or a function,
+not a wildcard.
+
 `Mcp-Method` and `Mcp-Name` are required on 2026-07-28 streamable HTTP POSTs, so
 browser clients on that revision need them allowed. That revision's
 `Mcp-Param-*` headers are a prefix, which `Access-Control-Allow-Headers` cannot
