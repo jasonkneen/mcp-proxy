@@ -1276,7 +1276,16 @@ const handleStreamRequest = async <T extends ServerLike>({
             await onConnect(server);
           }
         } catch (error) {
-          await cleanupServer(server, onClose);
+          // `cleanupServer` closes the server, which closes the transport it
+          // just attached, which re-enters the `onclose` handler above - and
+          // that leg cleans up unconditionally in stateless mode. Claim the
+          // flag first so it bails instead of running `onClose` a second time.
+          if (!isCleaningUp) {
+            isCleaningUp = true;
+
+            await cleanupServer(server, onClose);
+          }
+
           throw error;
         }
 
