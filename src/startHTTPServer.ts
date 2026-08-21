@@ -1269,10 +1269,24 @@ const handleStreamRequest = async <T extends ServerLike>({
           return true;
         }
 
-        await server.connect(transport);
+        try {
+          await server.connect(transport);
 
-        if (onConnect) {
-          await onConnect(server);
+          if (onConnect) {
+            await onConnect(server);
+          }
+        } catch (error) {
+          // `cleanupServer` closes the server, which closes the transport it
+          // just attached, which re-enters the `onclose` handler above - and
+          // that leg cleans up unconditionally in stateless mode. Claim the
+          // flag first so it bails instead of running `onClose` a second time.
+          if (!isCleaningUp) {
+            isCleaningUp = true;
+
+            await cleanupServer(server, onClose);
+          }
+
+          throw error;
         }
 
         await transport.handleRequest(req, res, body);
@@ -1297,10 +1311,15 @@ const handleStreamRequest = async <T extends ServerLike>({
           return true;
         }
 
-        await server.connect(transport);
+        try {
+          await server.connect(transport);
 
-        if (onConnect) {
-          await onConnect(server);
+          if (onConnect) {
+            await onConnect(server);
+          }
+        } catch (error) {
+          await cleanupServer(server, onClose);
+          throw error;
         }
 
         await transport.handleRequest(req, res, body);

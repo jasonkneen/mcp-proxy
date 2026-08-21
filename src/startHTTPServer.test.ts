@@ -3083,6 +3083,193 @@ it("returns 500 instead of crashing when connecting the server fails on the stat
   }
 }, 15_000);
 
+it("closes the legacy server when connect rejects after createServer acquires a resource", async () => {
+  const port = await getRandomPort();
+  let liveResources = 0;
+
+  const server = new Server(
+    { name: "cleanup-repro", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  vi.spyOn(server, "connect").mockRejectedValue(
+    new Error("connect failed after createServer acquired a resource"),
+  );
+  const close = vi.spyOn(server, "close").mockImplementation(async () => {
+    liveResources -= 1;
+  });
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+  const httpServer = await startHTTPServer({
+    createServer: async () => {
+      liveResources += 1;
+      return server;
+    },
+    port,
+    stateless: true,
+  });
+
+  try {
+    const response = await fetch(`http://localhost:${port}/mcp`, {
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "initialize",
+        params: {
+          capabilities: {},
+          clientInfo: { name: "cleanup-repro", version: "1.0.0" },
+          protocolVersion: "2025-03-26",
+        },
+      }),
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      method: "POST",
+    });
+
+    expect(response.status).toBe(500);
+    expect(close).toHaveBeenCalledOnce();
+    expect(liveResources).toBe(0);
+  } finally {
+    consoleError.mockRestore();
+    await httpServer.close();
+  }
+}, 15_000);
+
+it("closes the modern server when initialization fails after createServer acquires a resource", async () => {
+  const port = await getRandomPort();
+  let liveResources = 0;
+
+  const server = new Server(
+    { name: "cleanup-control", version: "1.0.0" },
+    { capabilities: { tools: {} } },
+  );
+  const close = vi.spyOn(server, "close").mockImplementation(async () => {
+    liveResources -= 1;
+  });
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+  const httpServer = await startHTTPServer({
+    createServer: async () => {
+      liveResources += 1;
+      return server;
+    },
+    onConnect: async () => {
+      throw new Error("initialization failed after createServer acquired a resource");
+    },
+    port,
+  });
+
+  try {
+    const response = await fetch(`http://localhost:${port}/mcp`, {
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "tools/list",
+        params: {
+          _meta: {
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {
+              name: "cleanup-control",
+              version: "1.0.0",
+            },
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+          },
+        },
+      }),
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "mcp-method": "tools/list",
+      },
+      method: "POST",
+    });
+
+    expect(response.status).toBe(500);
+    expect(close).toHaveBeenCalledOnce();
+    expect(liveResources).toBe(0);
+  } finally {
+    consoleError.mockRestore();
+    await httpServer.close();
+  }
+}, 15_000);
+
+/**
+ * The two tests above both fail before `connect` attaches a transport, which is
+ * the easy half of the problem. This is the other half: the legacy stateless
+ * `initialize` branch installs its own `transport.onclose`, and a `connect`
+ * that succeeded hands that transport to the SDK. Closing the server therefore
+ * re-enters that handler, which cleans up unconditionally in stateless mode -
+ * so the failure path has to claim the cleanup flag rather than hand the
+ * consumer's `onClose` the same server twice.
+ */
+it("closes the legacy stateless server exactly once when onConnect throws after connect succeeds", async () => {
+  const port = await getRandomPort();
+  let liveResources = 0;
+  let onCloseCalls = 0;
+
+  const server = new Server(
+    { name: "cleanup-once", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  // Deliberately not stubbed: the real `close()` is what tears down the
+  // attached transport and re-enters `transport.onclose`.
+  const close = vi.spyOn(server, "close");
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+
+  const httpServer = await startHTTPServer({
+    createServer: async () => {
+      liveResources += 1;
+
+      return server;
+    },
+    onClose: async () => {
+      onCloseCalls += 1;
+      liveResources -= 1;
+    },
+    onConnect: async () => {
+      throw new Error("initialization failed after connect attached");
+    },
+    port,
+    stateless: true,
+  });
+
+  try {
+    const response = await fetch(`http://localhost:${port}/mcp`, {
+      body: JSON.stringify({
+        id: 1,
+        jsonrpc: "2.0",
+        method: "initialize",
+        params: {
+          capabilities: {},
+          clientInfo: { name: "cleanup-once", version: "1.0.0" },
+          protocolVersion: "2025-03-26",
+        },
+      }),
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      method: "POST",
+    });
+
+    expect(response.status).toBe(500);
+
+    // The SDK invokes `transport.onclose` without awaiting it, so a duplicate
+    // cleanup lands after the response. Give it room to arrive, otherwise this
+    // passes on a broken build for the wrong reason.
+    await delay(250);
+
+    expect(onCloseCalls).toBe(1);
+    expect(close).toHaveBeenCalledOnce();
+    expect(liveResources).toBe(0);
+  } finally {
+    close.mockRestore();
+    consoleError.mockRestore();
+    await httpServer.close();
+  }
+}, 15_000);
+
 /**
  * Ending a session is the client's job, and 2025-era clients overwhelmingly
  * never do it - they close a laptop or lose a network and are never heard from
